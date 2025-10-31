@@ -2,3 +2,4 @@ fastmcp
 fastapi
 mcp[cli]
 openai
+ag-ui-protocol
