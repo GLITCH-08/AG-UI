@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import Client
@@ -28,7 +28,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -66,6 +66,8 @@ async def interact_with_server(user_prompt: str, client):
                 for tool in tool_descriptions
             ]
 
+            print(tool_descriptions)
+
             messages = [
                 {
                     "role": "user",
@@ -76,13 +78,17 @@ async def interact_with_server(user_prompt: str, client):
                 }
             ]
 
+            print(messages)
+
             while True:
+                print("🟢 Sending prompt to Azure OpenAI:", user_prompt)
                 response = llm.chat.completions.create(
                     model=os.getenv("deployment"),
                     messages=messages,
                     tool_choice="auto",
                     tools=openai_tools,
                 )
+                print("🟢 Got response:", response)
 
                 message = response.choices[0].message
 
@@ -90,6 +96,7 @@ async def interact_with_server(user_prompt: str, client):
                 if message.tool_calls:
                     for tool_call in message.tool_calls:
                         tool_name = tool_call.function.name
+                        print(tool_name)
                         tool_args = json.loads(tool_call.function.arguments)
 
                         yield encoder.encode(
@@ -162,14 +169,25 @@ async def interact_with_server(user_prompt: str, client):
         print("🔚 Interaction complete.")
 
 
-@app.get("/get_data")
-async def stream_response(userprompt: str):
+@app.post("/get_data")
+async def stream_response(userprompt: str = Query(...)):
+    print(f"🟡 Received userprompt: {userprompt}")
     """Expose AG-UI event stream for the React frontend."""
     async def event_generator():
         async for event in interact_with_server(userprompt, client):
             yield event
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    return StreamingResponse(
+    event_generator(),
+    media_type="text/event-stream",
+    headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Transfer-Encoding": "chunked"
+    },
+)
+
 
 
 if __name__ == "__main__":
