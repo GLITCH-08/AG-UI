@@ -23,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = Client("http://127.0.0.1:8000/mcp")
+client = Client("mcp_server.py")
 
 endpoint = os.getenv("endpoint")
 model_name = os.getenv("model_name")
@@ -173,7 +173,7 @@ async def get_data(userprompt: str):
     data = await interact_with_server(userprompt, client)
     return {"status": "success", "data": data}
 
-if __name__ == "_main_":
+if __name__ == "__main__":
     print("🚀 Starting FastAPI MCP Client Middleware...")
     print("🌐 FastAPI middleware will run on: http://127.0.0.1:8001")
 
