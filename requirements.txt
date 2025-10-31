@@ -1,0 +1,4 @@
+fastmcp
+fastapi
+mcp[cli]
+openai

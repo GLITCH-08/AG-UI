@@ -1,2 +1,3 @@
 /env_ag
-/backend/.env
+.env
+__pycache__
