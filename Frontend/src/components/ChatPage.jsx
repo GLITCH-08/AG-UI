@@ -1,13 +1,14 @@
 import React, { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Send, Bot, Sparkles, Wrench, CheckCircle } from "lucide-react";
+
 import MessageBubble from "./MessageBubble.jsx";
  
 const initialMessages = [
   {
     id: 1,
     role: "assistant",
-    content: "Hey Priyanshu 👋 I'm your chatbot. Ask me anything!",
+    content: "Hello! 👋 I'm your IndiGo Ops Assistant. How can I help?",
     time: "11:00 AM",
   },
 ];
@@ -16,14 +17,47 @@ export default function ChatPage() {
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+
   const [currentStatus, setCurrentStatus] = useState("online");
   const [toolCalls, setToolCalls] = useState([]);
   const bottomRef = useRef(null);
- 
-  useEffect(() => {
+ const [userHasScrolled, setUserHasScrolled] = useState(false);
+const [isNearBottom, setIsNearBottom] = useState(true);
+
+useEffect(() => {
+  // Only auto-scroll if user hasn't manually scrolled up OR if they're near the bottom
+  if (!userHasScrolled || isNearBottom) {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, toolCalls]);
- 
+  }
+}, [messages, toolCalls, userHasScrolled, isNearBottom]);
+
+// Add scroll listener to detect user scrolling
+useEffect(() => {
+  const chatMain = document.querySelector('.chat-main');
+  if (!chatMain) return;
+
+  const handleScroll = () => {
+    const { scrollTop, scrollHeight, clientHeight } = chatMain;
+    const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+    
+    // Consider "near bottom" if within 50px of the bottom
+    const nearBottom = distanceFromBottom < 50;
+    setIsNearBottom(nearBottom);
+    
+    // If user scrolled up significantly, mark as user-scrolled
+    if (distanceFromBottom > 100) {
+      setUserHasScrolled(true);
+    } else if (nearBottom) {
+      // Reset when user scrolls back to bottom
+      setUserHasScrolled(false);
+    }
+  };
+
+  chatMain.addEventListener('scroll', handleScroll);
+  return () => chatMain.removeEventListener('scroll', handleScroll);
+}, []);
+// ...existing code...
+
   const sendMessage = async () => {
     if (!input.trim() || isLoading) return;
  
@@ -42,8 +76,10 @@ export default function ChatPage() {
     setInput("");
     setIsLoading(true);
     setCurrentStatus("thinking...");
-    setToolCalls([]);
- 
+    setToolCalls([]); // Clear previous tool calls
+    setUserHasScrolled(false);
+    setIsNearBottom(true); 
+
     try {
       const response = await fetch(
         `http://127.0.0.1:8001/get_data?userprompt=${encodeURIComponent(userPrompt)}`,
@@ -108,7 +144,6 @@ export default function ChatPage() {
                   break;
  
                 case "TEXT_MESSAGE_CONTENT":
-                  // Append streamed text character by character
                   console.log(`📝 Received char: "${event.delta}"`);
                   assistantMsg.content += event.delta;
                   setMessages((prev) => {
@@ -126,43 +161,83 @@ export default function ChatPage() {
                   setCurrentStatus("online");
                   break;
  
+// ...existing code...
+
+                // ...existing code...
+
                 case "TOOL_CALL_START":
-                  console.log("🔧 Tool call started:", event.toolCallName);
+                  console.log("🔧 Tool call started:", event.toolCallName, "ID:", event.toolCallId);
+                  console.log("Current tool calls before adding:", toolCalls);
                   setCurrentStatus(`calling ${event.toolCallName}...`);
-                  setToolCalls((prev) => [
-                    ...prev,
-                    {
-                      id: event.tool_call_id,
+                  setToolCalls((prev) => {
+                    console.log("Previous tool calls:", prev);
+                    
+                    // Check if this tool call already exists
+                    const exists = prev.find(tc => tc.id === event.toolCallId);
+                    if (exists) {
+                      console.log("Tool call already exists, resetting:", event.toolCallId);
+                      return prev.map(tc => 
+                        tc.id === event.toolCallId 
+                          ? { ...tc, args: "", status: "calling" }
+                          : tc
+                      );
+                    }
+                    
+                    const newToolCall = {
+                      id: event.toolCallId, // Changed from event.tool_call_id
                       name: event.toolCallName,
                       args: "",
                       result: "",
                       status: "calling",
-                    },
-                  ]);
+                      expanded: false,
+                    };
+                    
+                    console.log("Adding new tool call:", newToolCall);
+                    const updated = [...prev, newToolCall];
+                    console.log("Updated tool calls array:", updated);
+                    return updated;
+                  });
                   break;
  
                 case "TOOL_CALL_ARGS":
-                  console.log("📝 Tool args:", event.delta);
-                  setToolCalls((prev) =>
-                    prev.map((tc) =>
-                      tc.id === event.tool_call_id
-                        ? { ...tc, args: event.delta }
-                        : tc
-                    )
-                  );
+                  console.log("📝 Tool args delta:", event.delta, "for tool ID:", event.toolCallId);
+                  setToolCalls((prev) => {
+                    console.log("Current tool calls before args update:", prev);
+                    
+                    const updated = prev.map((tc) => {
+                      if (tc.id === event.toolCallId) { // Changed from event.tool_call_id
+                        const newArgs = tc.args + event.delta;
+                        console.log(`Updating tool ${tc.id}: "${tc.args}" + "${event.delta}" = "${newArgs}"`);
+                        return { ...tc, args: newArgs };
+                      }
+                      return tc;
+                    });
+                    
+                    console.log("Tool calls after args update:", updated);
+                    return updated;
+                  });
                   break;
  
                 case "TOOL_CALL_RESULT":
-                  console.log("✅ Tool result:", event.content);
-                  setToolCalls((prev) =>
-                    prev.map((tc) =>
-                      tc.id === event.tool_call_id
+                  console.log("✅ Tool result:", event.content, "for tool ID:", event.toolCallId);
+                  setToolCalls((prev) => {
+                    console.log("Current tool calls before result update:", prev);
+                    
+                    const updated = prev.map((tc) =>
+                      tc.id === event.toolCallId // Changed from event.tool_call_id
                         ? { ...tc, result: event.content, status: "completed" }
                         : tc
-                    )
-                  );
+                    );
+                    
+                    console.log("Tool calls after result update:", updated);
+                    return updated;
+                  });
                   setCurrentStatus("processing results...");
                   break;
+
+// ...existing code...
+
+// ...existing code...
  
                 case "RUN_FINISHED":
                   console.log("🏁 Run finished");
@@ -219,6 +294,8 @@ export default function ChatPage() {
       setCurrentStatus("online");
     }
   };
+
+// ...existing code...;
  
   const handleKey = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -245,126 +322,137 @@ export default function ChatPage() {
         <div className="chat-header-right">
           <button
             className="header-pill"
-            onClick={() => {
-              setMessages(initialMessages);
-              setToolCalls([]);
-              setCurrentStatus("online");
-            }}
+           onClick={() => {
+  setMessages(initialMessages);
+  setToolCalls([]);
+  setCurrentStatus("online");
+
+}}
           >
             New Chat
           </button>
         </div>
       </header>
  
-      {/* Messages */}
-      <main className="chat-main">
-        <AnimatePresence>
-          {messages.map((msg) => (
-            <motion.div
-              key={msg.id}
-              initial={{ opacity: 0, y: 6, scale: 0.995 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -6 }}
-              transition={{ duration: 0.12 }}
-            >
-              <MessageBubble
-                role={msg.role}
-                content={msg.content}
-                time={msg.time}
-              />
-            </motion.div>
-          ))}
-        </AnimatePresence>
- 
-        {/* Tool Call Status Display */}
-        {toolCalls.length > 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="tool-calls-container"
-            style={{
-              background: "#f0f4ff",
-              borderRadius: "12px",
-              padding: "12px 16px",
-              marginTop: "8px",
-              border: "1px solid #d0d9ff",
-            }}
-          >
-            <div
-              style={{
-                fontSize: "0.75rem",
-                fontWeight: "600",
-                color: "#4f46e5",
-                marginBottom: "8px",
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-              }}
-            >
-              <Wrench size={14} />
-              Tool Calls
-            </div>
-            {toolCalls.map((tc) => (
-              <div
-                key={tc.id}
-                style={{
-                  background: "white",
-                  borderRadius: "8px",
-                  padding: "8px 10px",
-                  marginBottom: "6px",
-                  fontSize: "0.72rem",
-                  border: "1px solid #e0e7ff",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    marginBottom: "4px",
-                  }}
-                >
-                  {tc.status === "completed" ? (
-                    <CheckCircle size={12} color="#10b981" />
-                  ) : (
-                    <div
-                      style={{
-                        width: "12px",
-                        height: "12px",
-                        border: "2px solid #4f46e5",
-                        borderTopColor: "transparent",
-                        borderRadius: "50%",
-                        animation: "spin 0.8s linear infinite",
-                      }}
-                    />
-                  )}
-                  {/* tool name */}
-                  <strong style={{ color: "#1e293b" }}>{tc.name}</strong> 
-                </div>
-                {/* {tc.args && (
-                  <div style={{ color: "#64748b", marginLeft: "18px" }}>
-                    Args: {tc.args}
-                  </div>
-                )} */}
-                {tc.result && (
-                  <div
-                    style={{
-                      color: "#059669",
-                      marginLeft: "18px",
-                      marginTop: "4px",
-                    }}
-                  >
-                    Result: {tc.result}
-                  </div>
-                )}
-              </div>
-            ))}
-          </motion.div>
-        )}
- 
-        <div ref={bottomRef} />
-      </main>
- 
+
+
+
+<main className="chat-main">
+ <AnimatePresence>
+ {messages.map((msg, index) => {
+ const isLastAssistantMsg =
+ msg.role === "assistant" &&
+ index === messages.length - 1 &&
+ toolCalls.length > 0;
+ return (
+ <React.Fragment key={msg.id}>
+ {/* 💬 Render the assistant message */}
+ {msg.role === "assistant" && isLastAssistantMsg && toolCalls.length > 0 && (
+ <motion.div
+ initial={{ opacity: 0, y: 10 }}
+ animate={{ opacity: 1, y: 0 }}
+ className="tool-calls-container"
+ style={{
+ background: "hashtaghashtag#f0f4ff",
+ borderRadius: "12px",
+ padding: "12px 16px",
+ marginBottom: "8px",
+ border: "1px solid hashtaghashtag#d0d9ff",
+ }}
+ >
+ <div
+ style={{
+ fontSize: "0.75rem",
+ fontWeight: "600",
+ color: "hashtaghashtag#4f46e5",
+ marginBottom: "8px",
+ display: "flex",
+ alignItems: "center",
+ gap: "6px",
+ }}
+ >
+ <Wrench size={14} />
+ Tool Calls
+ </div>
+ {toolCalls.map((tc) => (
+ <div
+ key={tc.id}
+ style={{
+ background: "white",
+ borderRadius: "8px",
+ padding: "8px 10px",
+ marginBottom: "6px",
+ fontSize: "0.72rem",
+ border: "1px solid hashtaghashtag#e0e7ff",
+ }}
+ >
+ {/* Dropdown Header */}
+ <div onClick={() =>
+ setToolCalls((prev) =>
+ prev.map((tool) =>
+ tool.id === tc.id
+ ? { ...tool, expanded: !tool.expanded }
+ : tool
+ )
+ )
+ }
+ style={{
+ display: "flex",
+ alignItems: "center",
+ justifyContent: "space-between",
+ cursor: "pointer",
+ userSelect: "none",
+ }}
+ >
+ <strong style={{ color: "hashtaghashtag#1e293b" }}>{tc.name}</strong>
+ {tc.expanded ? "▲" : "▼"}
+ </div>
+ {/* Dropdown Content */}
+ {tc.expanded && (
+ <div
+ style={{
+ marginTop: "8px",
+ paddingLeft: "16px",
+ color: "hashtaghashtag#4b5563",
+ }}
+ >
+ <div>
+ <strong>Args:</strong> {tc.args || "N/A"}
+ </div>
+ {tc.result && (
+ <div>
+ <strong>Result:</strong> {tc.result}
+ </div>
+ )}
+ <div>
+ <strong>Status:</strong>{" "}
+ {tc.status === "completed" ? "Completed" : "In Progress"}
+ </div>
+ </div>
+ )}
+ </div>
+ ))}
+ </motion.div>
+ )}
+ {/* 💬 Render the message */}
+ <motion.div
+ initial={{ opacity: 0, y: 6, scale: 0.995 }}
+ animate={{ opacity: 1, y: 0, scale: 1 }}
+ exit={{ opacity: 0, y: -6 }}
+ transition={{ duration: 0.12 }}
+ >
+ <MessageBubble
+ role={msg.role}
+ content={msg.content}
+ time={msg.time}
+ />
+ </motion.div>
+ </React.Fragment>
+ );
+ })}
+ </AnimatePresence>
+ <div ref={bottomRef} />
+</main>
       {/* Input */}
       <footer className="chat-footer">
         <div className="input-box">
