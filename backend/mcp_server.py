@@ -1,22 +1,42 @@
 from typing import Any, List, Dict, Optional
 import asyncio
 from datetime import datetime, timedelta
-from mcp.server.fastmcp import FastMCP
 from motor.motor_asyncio import AsyncIOMotorClient
 import json
 from dotenv import load_dotenv
+import os, time, httpx
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.jwt import JWTVerifier
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Initialize FastMCP server
-mcp = FastMCP("metar-weather")
-
 # MongoDB configuration
-import os
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "metar_data")
 COLLECTION_METAR = os.getenv("COLLECTION_METAR", "metar_data")
+
+# ------------------- Config (server-only secrets) -------------------
+TENANT_ID = os.getenv("TENANT_ID")
+APP_ID = os.getenv("APP_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+PORT = int(os.getenv("PORT"))
+
+# OpenID metadata
+JWKS_URI = f"https://login.microsoftonline.com/{TENANT_ID}/discovery/v2.0/keys"
+ISSUER = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
+AUDIENCE = APP_ID
+
+# ------------------- MCP with JWT verification ----------------------
+auth = JWTVerifier(
+    jwks_uri=JWKS_URI,
+    issuer=ISSUER,
+    audience=AUDIENCE,
+)
+
+mcp = FastMCP(name="metar-weather", auth=auth)
 
 # Global MongoDB client
 client = None
@@ -68,6 +88,58 @@ def format_metar_data(metar_doc: Dict) -> str:
     
     return result
 
+@mcp.resource("resource://metar_json_schema")
+async def metar_format():
+    """Get the JSON schema for METAR data documents."""
+    schema = {
+        "_id": "ObjectId",
+        "stationICAO": "String",
+        "stationIATA": "String",
+        "hasMetarData": "Boolean",
+        "hasTaforData": "Boolean",
+        "metar": {
+            "updatedTime": "DateTime (ISO 8601)",
+            "firRegion": "String",
+            "rawData": "String",
+            "decodedData": {
+                "observation": {
+                    "observationTimeUTC": "DateTime (ISO 8601)",
+                    "observationTimeIST": "DateTime (ISO 8601)",
+                    "windSpeed": "String",
+                    "windDirection": "String",
+                    "horizontalVisibility": "String",
+                    "weatherConditions": "Null",
+                    "cloudLayers": ["String"],
+                    "airTemperature": "String",
+                    "dewpointTemperature": "String",
+                    "observedQNH": "String",
+                    "runwayVisualRange": "Null",
+                    "windShear": "Null",
+                    "runwayConditions": "Null"
+                },
+                "additionalInformation": {
+                    "weatherTrend": "Null",
+                    "forecastWeather": "Null"
+                },
+                "tempoSection": {
+                    "type": "Null",
+                    "timePeriod": "Null",
+                    "windSpeed": "Null",
+                    "windDirection": "Null",
+                    "visibility": "Null",
+                    "weatherConditions": "Null"
+                }
+            }
+        },
+        "tafor": {
+            "rawData": "String",
+            "updatedTime": "Null",
+            "timestamp": "DateTime (ISO 8601)"
+        }
+    }
+    return schema
+
+# ------------------- Tools (protected by JWTVerifier) ---------------
 @mcp.tool()
 async def search_metar_data(
     station_icao: str = None,
@@ -89,9 +161,9 @@ async def search_metar_data(
     """Generic search for METAR data with multiple optional filters.
 
     Args:
-        station_icao: Filter by ICAO code (e.g., 'VOTP')
-        station_iata: Filter by IATA code (e.g., 'TIR')
-        weather_condition: Search in raw METAR data (e.g., 'rain', 'fog', 'CB')
+        station_icao: Filter by ICAO code (e.g., 'VOTP', 'VIDP', 'VOBG')
+        station_iata: Filter by IATA code (e.g., 'TIR', 'BOM', 'DEL')
+        weather_condition: Search in raw METAR data (e.g., 'Rain', 'fog', 'CB')
         temperature_min: Minimum temperature in Celsius
         temperature_max: Maximum temperature in Celsius
         visibility_min: Minimum visibility in meters
@@ -103,7 +175,7 @@ async def search_metar_data(
         cloud_type: Search for cloud types in raw data (e.g., 'CB', 'SCT', 'OVC')
         fir_region: Filter by FIR region (e.g., 'Chennai', 'Mumbai')
         hours_back: Look back N hours from now
-        limit: Maximum results to return (default: 10, max: 50)
+        limit: Maximum results to return (set default as: 10, max: 50)
     """
     try:
         _, db = await get_mongodb_client()
@@ -124,11 +196,11 @@ async def search_metar_data(
         # Time filter
         if hours_back:
             time_threshold = datetime.now() - timedelta(hours=hours_back)
-            query["processed_timestamp"] = {"$gte": time_threshold}
+            query["timestamp"] = {"$gte": time_threshold}
         
         # Weather condition filter (search in raw METAR data)
         if weather_condition:
-            query["metar.rawData"] = {"$regex": weather_condition, "$options": "i"}
+            query["metar.decodedData.observation.weatherConditions"] = weather_condition
         
         # Cloud type filter (search in raw METAR data)
         if cloud_type:
@@ -174,8 +246,8 @@ async def search_metar_data(
         limit = min(limit, 50)
         
         # Execute the query
-        print(query)
-        cursor = db[COLLECTION_METAR].find(query).sort("processed_timestamp", -1).limit(limit)
+        print(f"🔍 Executing MongoDB query: {query}")
+        cursor = db[COLLECTION_METAR].find(query).sort("timestamp", -1).limit(limit)
         results = await cursor.to_list(length=limit)
         
         if not results:
@@ -212,15 +284,12 @@ async def search_metar_data(
         return result
         
     except Exception as e:
+        print(f"❌ Error in search_metar_data: {e}")
         return f"Error executing search: {str(e)}"
 
 @mcp.tool()
 async def list_available_stations() -> str:
-    """List all available weather stations with their codes.
-
-    Returns:
-        String containing all available ICAO and IATA codes
-    """
+    """List all available weather stations with their codes."""
     try:
         _, db = await get_mongodb_client()
         
@@ -236,23 +305,23 @@ async def list_available_stations() -> str:
         # Get station count
         total_stations = await db[COLLECTION_METAR].count_documents({})
         
-        result = f" Available Weather Stations ({total_stations} total reports)\n"
+        result = f"📡 Available Weather Stations ({total_stations} total reports)\n"
         result += "=" * 50 + "\n\n"
         
-        result += f"  ICAO Codes ({len(icao_codes)} stations):\n"
+        result += f"🛩️  ICAO Codes ({len(icao_codes)} stations):\n"
         for i, code in enumerate(icao_codes, 1):
             result += f"   {i:3d}. {code}"
-            if i % 10 == 0:  # New line every 10 codes
+            if i % 10 == 0:
                 result += "\n"
             else:
                 result += "  "
         if len(icao_codes) % 10 != 0:
             result += "\n"
         
-        result += f"\nIATA Codes ({len(iata_codes)} stations):\n"
+        result += f"\n🏢 IATA Codes ({len(iata_codes)} stations):\n"
         for i, code in enumerate(iata_codes, 1):
             result += f"   {i:3d}. {code}"
-            if i % 10 == 0:  # New line every 10 codes
+            if i % 10 == 0:
                 result += "\n"
             else:
                 result += "  "
@@ -262,15 +331,12 @@ async def list_available_stations() -> str:
         return result
         
     except Exception as e:
+        print(f"❌ Error in list_available_stations: {e}")
         return f"Error retrieving station list: {str(e)}"
 
 @mcp.tool()
 async def get_metar_statistics() -> str:
-    """Get statistics about the METAR database.
-
-    Returns:
-        String containing database statistics
-    """
+    """Get statistics about the METAR database."""
     try:
         _, db = await get_mongodb_client()
         
@@ -289,39 +355,35 @@ async def get_metar_statistics() -> str:
         with_metar = await db[COLLECTION_METAR].count_documents({"hasMetarData": True})
         with_taf = await db[COLLECTION_METAR].count_documents({"hasTaforData": True})
         
-        result = f" METAR Database Statistics\n"
+        result = f"📊 METAR Database Statistics\n"
         result += "=" * 40 + "\n\n"
         
-        result += f"Document Counts:\n"
+        result += f"📈 Document Counts:\n"
         result += f"   METAR Reports: {total_metar:,}\n\n"
         
-        result += f" Station Information:\n"
+        result += f"🛩️  Station Information:\n"
         result += f"   Unique ICAO Codes: {unique_icao}\n"
         result += f"   Unique IATA Codes: {unique_iata}\n\n"
         
-        result += f" Data Range:\n"
+        result += f"📅 Data Range:\n"
         if earliest:
-            result += f"   Earliest: {earliest[0]["metar"]["updatedTime"]}\n"
+            result += f"   Earliest: {earliest[0]['metar']['updatedTime']}\n"
         if latest:
-            result += f"   Latest: {latest[0]["metar"]["updatedTime"]}\n\n"
+            result += f"   Latest: {latest[0]['metar']['updatedTime']}\n\n"
         
-        result += f"  Availability:\n"
+        result += f"✅ Availability:\n"
         result += f"   Reports with METAR: {with_metar:,} ({with_metar/total_metar*100:.1f}%)\n"
         result += f"   Reports with TAF: {with_taf:,} ({with_taf/total_metar*100:.1f}%)\n"
         
         return result
         
     except Exception as e:
+        print(f"❌ Error in get_metar_statistics: {e}")
         return f"Error retrieving statistics: {str(e)}"
 
 @mcp.tool()
 async def raw_mongodb_query(query_json: str, limit: int = 10) -> str:
-    """Execute a raw MongoDB query against the METAR database.
-
-    Args:
-        query_json: JSON string containing MongoDB query (e.g., '{"stationICAO": "VOTP"}')
-        limit: Maximum number of results to return (default: 10, max: 50)
-    """
+    """Execute a raw MongoDB query against the METAR database."""
     try:
         _, db = await get_mongodb_client()
         
@@ -332,10 +394,10 @@ async def raw_mongodb_query(query_json: str, limit: int = 10) -> str:
             return f"Invalid JSON query: {str(e)}\n\nExample: '{{\"stationICAO\": \"VOTP\"}}'"
         
         # Limit the number of results
-        limit = min(limit, 50)  # Cap at 50 results
+        limit = min(limit, 50)
         
-        # Execute the query
-        cursor = db[COLLECTION_METAR].find(query).sort("processed_timestamp", -1).limit(limit)
+        print(f"🔍 Executing raw MongoDB query: {query}")
+        cursor = db[COLLECTION_METAR].find(query).sort("metar.updatedTime", -1).limit(limit)
         results = await cursor.to_list(length=limit)
         
         if not results:
@@ -354,18 +416,89 @@ async def raw_mongodb_query(query_json: str, limit: int = 10) -> str:
         return result
         
     except Exception as e:
+        print(f"❌ Error in raw_mongodb_query: {e}")
         return f"Error executing query: {str(e)}"
 
-@mcp.tool() 
-async def health_check(): 
-    return "OK"
+@mcp.tool()
+async def ping() -> str:
+    """Simple ping tool for testing authentication."""
+    return "🏓 Pong! Authentication working correctly."
 
+# ------------------- Custom routes (public) -------------------------
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check_route(request: Request):
+    """Health check endpoint - no authentication required."""
+    return JSONResponse({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "server": "metar-weather-mcp",
+        "azure_config": {
+            "tenant_id": TENANT_ID,
+            "app_id": APP_ID,
+            "auth_enabled": True
+        }
+    })
+
+@mcp.custom_route("/auth/token", methods=["POST"])
+async def issue_token(request: Request):
+    """
+    Client yahan POST karega (no body needed).
+    Server Azure se app-only token nikaal ke return karega.
+    """
+    print(f"🔐 Token request received from client")
+    
+    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    form = {
+        "client_id": APP_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "client_credentials",
+        "scope": f"api://{APP_ID}/.default",
+    }
+    
+    print(f"🔄 Requesting token from Azure AD: {token_url}")
+    print(f"📋 Form data: client_id={APP_ID}, scope=api://{APP_ID}/.default")
+    
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.post(token_url, data=form)
+            print(f"🌐 Azure AD response status: {resp.status_code}")
+            
+    except Exception as e:
+        print(f"❌ Azure token request failed: {e}")
+        return JSONResponse(
+            {"error": "azure_token_request_failed", "detail": str(e)}, 
+            status_code=502
+        )
+
+    if resp.status_code != 200:
+        print(f"❌ Azure AD error: {resp.text}")
+        # Azure ka raw error dikha do (AADSTS codes) for debugging
+        return JSONResponse(
+            {"error": "azure_token_error", "azure_body": resp.text}, 
+            status_code=resp.status_code
+        )
+
+    body = resp.json()
+    print(f"✅ Successfully obtained token from Azure AD")
+    print(f"📊 Token expires in: {body.get('expires_in')} seconds")
+    
+    return JSONResponse({
+        "access_token": body.get("access_token"),
+        "expires_in": body.get("expires_in"),
+        "token_type": body.get("token_type", "Bearer"),
+        "issued_at": int(time.time()),
+    })
 
 if __name__ == "__main__":
     # Initialize and run the server
-    print("METAR MCP Server starting...")
-    print(f"MongoDB URL: {MONGODB_URL}")
-    print(f"Database: {DATABASE_NAME}")
-    print(f"Collection: {COLLECTION_METAR}")
-    print("Server ready! Waiting for HTTP requests...")
-    mcp.run(transport='stdio')
+    print("🚀 METAR MCP Server with Azure Authentication starting...")
+    print(f"🗄️  MongoDB URL: {MONGODB_URL}")
+    print(f"📊 Database: {DATABASE_NAME}")
+    print(f"🏷️  Collection: {COLLECTION_METAR}")
+    print(f"🔐 Azure Tenant ID: {TENANT_ID}")
+    print(f"🏢 Azure App ID: {APP_ID}")
+    print(f"🌐 Port: {PORT}")
+    print("✅ Server ready! Waiting for HTTP requests...")
+    
+    # same port par custom routes + MCP endpoint serve honge
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=PORT)
